@@ -1,6 +1,14 @@
 /**
       LEDClock using tasks
-
+      NOTE If have two strips defined with same pin
+        Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+        Adafruit_NeoPixel strip2 = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+        both can be used.
+        USES: if strip.show(); strip2.show();    acts like sending data to led strip of joined length
+              if have tasks to flip between the two shows, then will mix.
+        can call strip.show() and strip2.show() to alternate
+        also if call one after the other acts like joining two strips as very little gap between signals sent.
+  Test on Generic ESP8266 module (swage) 2MB with 256K FS
 */
 
 //#define _TASK_SLEEP_ON_IDLE_RUN
@@ -151,6 +159,13 @@ int noteDurations[] = {
 };
 int melodyNoteIndex;
 
+// global for trainbow cb fcns
+long RB_firstPixelHue;
+long RB_start;
+int RB_wait = 5;
+int RB_duration = 5000;
+
+
 #include "localwificonfig.h"
 Scheduler ts;
 
@@ -179,6 +194,9 @@ void playMelody();
 bool playMelodyOnEnable();
 void playMelodyOnDisable();
 void changeClock();
+void rainbowCallback();
+//void rainbowOnDisable();
+bool rainbowOnEnable();
 
 // Tasks
 
@@ -190,13 +208,13 @@ Task  tOTARun  (TASK_SECOND / 16, TASK_FOREVER, &OTARun, &ts, false);
 Task  tMDNSRun  (TASK_SECOND / 16, TASK_FOREVER, &MDNSRun, &ts, false);
 Task  tLED        (TASK_IMMEDIATE, TASK_FOREVER, &ledCallback, &ts, false, &ledOnEnable, &ledOnDisable);
 Task  tplayMelody (TASK_IMMEDIATE, TASK_FOREVER, &playMelody, &ts, false, &playMelodyOnEnable, &playMelodyOnDisable);
-Task tchangeClock (TASK_SECOND, TASK_FOREVER, &changeClock, &ts, true);
+Task tchangeClock (TASK_SECOND, TASK_FOREVER, &changeClock, &ts, false);
+Task trainbow (TASK_SECOND, TASK_FOREVER, &rainbowCallback, &ts, false, &rainbowOnEnable);
 // Tasks running on events
 Task  tNtpUpdate  (&ntpUpdateInit, &ts);
 
 
 long  ledDelayRed, ledDelayBlue;
-
 #define CONNECT_TIMEOUT   30      // Seconds
 #define CONNECT_OK        0       // Status of successful connection to WiFi
 #define CONNECT_FAILED    (-99)   // Status of failed connection to WiFi
@@ -221,8 +239,10 @@ WiFiUDP udp;                      // A UDP instance to let us send and receive p
 //************* Declare NeoPixel ******************************
 //Using 1M WS2812B 5050 RGB Non-Waterproof 16 LED Ring
 // use NEO_KHZ800 but maybe 400 makes wifi more stable???
-#define NUM_LEDS 16
+#define NUM_LEDS 6
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel stripred = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel stripblue = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 bool ClockInitialized = false;
 
@@ -244,7 +264,10 @@ void setup() {
   startOTA();                  // Start the OTA service
   startSPIFFS();               // Start the SPIFFS and list all contents
   strip.begin(); // This initializes the NeoPixel library.
-
+  stripred.begin(); // This initializes the NeoPixel library.
+  stripblue.begin(); // This initializes the NeoPixel library.
+  stripred.fill(0x100000);
+  stripblue.fill(0x000010);
   randomSeed(now());
 
   // Initialize alarmTime(s) to default (now)
@@ -278,8 +301,8 @@ void setup() {
   Serial.println();
   Serial.println(buf);
 
-  colorAll(strip.Color(127, 0, 0), 1000, now());
-  Draw_Clock(0, 3); // Add the quater hour indicators
+  //colorAll(strip.Color(127, 0, 0), 1000, now());
+  //Draw_Clock(0, 3); // Add the quater hour indicators
   calcSun();
 }
 
@@ -464,9 +487,10 @@ void ntpCheck() {
     adjustTime(hours_Offset_From_GMT * 3600);
     if (IsDst()) adjustTime(3600); // offset the system time by an hour for Daylight Savings
     ClockInitialized = true;
-    ledDelayRed = TASK_SECOND / 3;
-    ledDelayBlue = 2 * TASK_SECOND;
+    ledDelayRed = TASK_SECOND / 3; //1
+    ledDelayBlue = 2 * TASK_SECOND; //2
     //tLED.disable();
+    tchangeClock.enable();
     tNtpUpdate.disable();
     udp.stop();
   }
@@ -840,6 +864,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         Second = SliderColor;
       } else if (payload[0] == 'R') {                      // the browser sends an R when the rainbow effect is enabled
         light_alarm_flag = true;
+        trainbow.enable();
       } else if (payload[0] == 'L') {                      // the browser sends an L when the meLody effect is enabled
         sound_alarm_flag = true;
         tplayMelody.enable();
@@ -1099,6 +1124,27 @@ void playMelody() {
   tplayMelody.delay( pauseBetweenNotes );
 }
 
+bool rainbowOnEnable() {
+  RB_firstPixelHue = 0;
+  RB_start = millis();
+  return true;
+}
+
+void rainbowCallback() {
+  for (int i = 0; i < strip.numPixels(); i++) { // For each pixel in strip...
+    int pixelHue = RB_firstPixelHue + (ClockCorrect(i) * 65536L / strip.numPixels());
+    strip.setPixelColor(ClockCorrect(i), strip.gamma32(strip.ColorHSV(pixelHue)));
+  }
+  SetBrightness(now()); // Set the clock brightness dependant on the time
+  strip.show(); // Update strip with new contents
+  RB_firstPixelHue += 256;
+  if ((millis() - RB_start) > RB_duration) {
+    trainbow.disable();
+  } else {
+    trainbow.delay(RB_wait);  // Pause for a moment
+  }
+}
+
 
 /*
    Flip the LED state based on the current state
@@ -1129,8 +1175,9 @@ void ledOnDisable() {
 */
 void ledRed() {
   ledState = true;
-  strip.fill(0x100000);
-  strip.show();
+  //strip.fill(0x100000);
+  //strip.show();
+  stripred.show();
   tLED.delay( ledDelayRed );
 }
 
@@ -1139,13 +1186,16 @@ void ledRed() {
 */
 void ledBlue() {
   ledState = false;
-  strip.fill(0x000010);
-  strip.show();
+  //strip.fill(0x000010);
+  //strip.show();
+  stripblue.show();
   tLED.delay( ledDelayBlue );
 }
 
 
 void changeClock() {
+  //tLED.disable();
+  //tLED.enableDelayed(500);
   time_t tnow = now(); // Get the current time seconds
   if (second() == 0)
     digitalClockDisplay();
@@ -1790,8 +1840,6 @@ void rainbow(int wait, int ncolorloop, time_t t) {
     delay(wait);  // Pause for a moment
   }
 }
-
-
 
 // Rainbow-enhanced theater marquee. Pass delay time (in ms) between frames.
 void theaterChaseRainbow(int wait, time_t t) {
