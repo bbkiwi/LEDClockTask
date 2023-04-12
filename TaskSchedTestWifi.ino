@@ -9,10 +9,12 @@
         can call strip.show() and strip2.show() to alternate
         also if call one after the other acts like joining two strips as very little gap between signals sent.
   Test on Generic ESP8266 module (swage) 2MB with 256K FS
+  Test on Esp8266 Node bread board attached to 60 LED ring 4MB 2 MB FS
 */
 
 //#define _TASK_SLEEP_ON_IDLE_RUN
 #define _TASK_STATUS_REQUEST
+#define _TASK_LTS_POINTER       // Compile with support for Local Task Storage pointer
 #include <TaskScheduler.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -101,7 +103,7 @@ RGB SecondNight = { 0, 0, 0 }; //off
 RGB SliderColor = {0, 0, 0};
 
 // Make clock go forwards or backwards (dependant on hardware)
-bool ClockGoBackwards = true;
+bool ClockGoBackwards = false;
 
 //Set your timezone in hours difference rom GMT
 int hours_Offset_From_GMT = 12;
@@ -159,12 +161,21 @@ int noteDurations[] = {
 };
 int melodyNoteIndex;
 
-// global for trainbow cb fcns
-long RB_firstPixelHue;
-long RB_start;
-int RB_wait = 5;
-int RB_duration = 5000;
+// for trainbow parms for call back
+typedef struct {
+  long firstPixelHue;
+  long start;
+  int wait = 5;
+  int ex = 1;
+  long firsthue;
+  int hueinc = 256;
+  int ncolorloop = 1;
+  int ncolorfrac = 1;
+  int nodepix = 0;
+  uint16_t duration = 10000;
+} rainbow_parm;
 
+rainbow_parm rainbowParm;
 
 #include "localwificonfig.h"
 Scheduler ts;
@@ -209,9 +220,10 @@ Task  tMDNSRun  (TASK_SECOND / 16, TASK_FOREVER, &MDNSRun, &ts, false);
 Task  tLED        (TASK_IMMEDIATE, TASK_FOREVER, &ledCallback, &ts, false, &ledOnEnable, &ledOnDisable);
 Task  tplayMelody (TASK_IMMEDIATE, TASK_FOREVER, &playMelody, &ts, false, &playMelodyOnEnable, &playMelodyOnDisable);
 Task tchangeClock (TASK_SECOND, TASK_FOREVER, &changeClock, &ts, false);
-Task trainbow (TASK_SECOND, TASK_FOREVER, &rainbowCallback, &ts, false, &rainbowOnEnable);
+Task trainbow (TASK_IMMEDIATE, TASK_FOREVER, &rainbowCallback, &ts, false, &rainbowOnEnable);
 // Tasks running on events
 Task  tNtpUpdate  (&ntpUpdateInit, &ts);
+
 
 
 long  ledDelayRed, ledDelayBlue;
@@ -239,7 +251,7 @@ WiFiUDP udp;                      // A UDP instance to let us send and receive p
 //************* Declare NeoPixel ******************************
 //Using 1M WS2812B 5050 RGB Non-Waterproof 16 LED Ring
 // use NEO_KHZ800 but maybe 400 makes wifi more stable???
-#define NUM_LEDS 6
+#define NUM_LEDS 60
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel stripred = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel stripblue = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -304,6 +316,9 @@ void setup() {
   //colorAll(strip.Color(127, 0, 0), 1000, now());
   //Draw_Clock(0, 3); // Add the quater hour indicators
   calcSun();
+
+  // Must be here in startup
+  trainbow.setLtsPointer (&rainbowParm);
 }
 
 void loop() {
@@ -440,9 +455,11 @@ void MDNSRun () {
 
 
 // Modified for Southern Hemisphere DST
+// NZ daylight savings ends first Sunday of April at 3AM
+// NZ daylight starts last Sunday of September at 2AM
 bool IsDst()
 {
-  int previousSunday = day() - weekday();
+  int previousSunday = day() - weekday() + 1;
   //Serial.print("    IsDst ");
   //Serial.print(month());
   //Serial.println(previousSunday);
@@ -450,10 +467,11 @@ bool IsDst()
   if (month() > 4 && month() < 9)  return false;
 
 
-  if (month() == 4) return previousSunday < 8;
+  if (month() == 4) return previousSunday < 1;
   if (month() == 9) return previousSunday > 23;
-  return false; // this line never gonna happend
+  return false; // this line never gonna happen
 }
+
 
 /**
    Check if NTP packet was received
@@ -489,7 +507,7 @@ void ntpCheck() {
     ClockInitialized = true;
     ledDelayRed = TASK_SECOND / 3; //1
     ledDelayBlue = 2 * TASK_SECOND; //2
-    //tLED.disable();
+    tLED.disable();
     tchangeClock.enable();
     tNtpUpdate.disable();
     udp.stop();
@@ -864,6 +882,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         Second = SliderColor;
       } else if (payload[0] == 'R') {                      // the browser sends an R when the rainbow effect is enabled
         light_alarm_flag = true;
+        rainbowParm.ncolorloop = random(4);
+        rainbowParm.ncolorfrac = random(1, 5);
+        rainbowParm.hueinc = random(255);
+        rainbowParm.wait = random(20);
+        Serial.printf("ncolorloop = %d, ncolorfrac = %d, hueinc = %d, wait = %d\n", rainbowParm.ncolorloop, rainbowParm.ncolorfrac, rainbowParm.hueinc, rainbowParm.wait);
+
         trainbow.enable();
       } else if (payload[0] == 'L') {                      // the browser sends an L when the meLody effect is enabled
         sound_alarm_flag = true;
@@ -1125,23 +1149,28 @@ void playMelody() {
 }
 
 bool rainbowOnEnable() {
-  RB_firstPixelHue = 0;
-  RB_start = millis();
+  Task& T = ts.currentTask();
+  rainbow_parm& parm = *((rainbow_parm*) T.getLtsPointer());
+  parm.firstPixelHue = parm.firsthue;
+  parm.start = millis();
   return true;
 }
 
 void rainbowCallback() {
+  Task& T = ts.currentTask();
+  rainbow_parm& parm = *((rainbow_parm*) T.getLtsPointer());
+
   for (int i = 0; i < strip.numPixels(); i++) { // For each pixel in strip...
-    int pixelHue = RB_firstPixelHue + (ClockCorrect(i) * 65536L / strip.numPixels());
-    strip.setPixelColor(ClockCorrect(i), strip.gamma32(strip.ColorHSV(pixelHue)));
+    int pixelHue = parm.firstPixelHue + (i * parm.ncolorloop *  65536L / strip.numPixels() / parm.ncolorfrac);
+    strip.setPixelColor(ClockCorrect(i + parm.nodepix), strip.gamma32(strip.ColorHSV(pixelHue)));
   }
   SetBrightness(now()); // Set the clock brightness dependant on the time
   strip.show(); // Update strip with new contents
-  RB_firstPixelHue += 256;
-  if ((millis() - RB_start) > RB_duration) {
+  parm.firstPixelHue += parm.hueinc;
+  if ((millis() - parm.start) > parm.duration) {
     trainbow.disable();
   } else {
-    trainbow.delay(RB_wait);  // Pause for a moment
+    trainbow.delay(parm.wait);  // Pause for a moment
   }
 }
 
