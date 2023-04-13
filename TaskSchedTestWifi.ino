@@ -189,6 +189,13 @@ bool SetClockFromNTP();
 bool IsDst();
 bool IsDay();
 
+#define CONNECT_TIMEOUT   30      // Seconds
+#define CONNECT_OK        0       // Status of successful connection to WiFi
+#define CONNECT_FAILED    (-99)   // Status of failed connection to WiFi
+#define NTP_CHECK_SEC  36001       // NTP server called every interval
+// NTP Related Definitions
+#define NTP_PACKET_SIZE  48       // NTP time stamp is in the first 48 bytes of the message
+
 // Callback methods prototypes
 void connectInit();
 void ledCallback();
@@ -197,6 +204,7 @@ void ledOnDisable();
 void ledRed();
 void ledBlue();
 void ntpUpdateInit();
+void ntpCheck();
 void serverRun();
 void webSocketRun();
 void OTARun();
@@ -221,18 +229,13 @@ Task  tLED        (TASK_IMMEDIATE, TASK_FOREVER, &ledCallback, &ts, false, &ledO
 Task  tplayMelody (TASK_IMMEDIATE, TASK_FOREVER, &playMelody, &ts, false, &playMelodyOnEnable, &playMelodyOnDisable);
 Task tchangeClock (TASK_SECOND, TASK_FOREVER, &changeClock, &ts, false);
 Task trainbow (TASK_IMMEDIATE, TASK_FOREVER, &rainbowCallback, &ts, false, &rainbowOnEnable);
+Task tntpCheck ( TASK_SECOND, CONNECT_TIMEOUT, &ntpCheck, &ts, false );
 // Tasks running on events
-Task  tNtpUpdate  (&ntpUpdateInit, &ts);
+Task  tntpUpdate  (&ntpUpdateInit, &ts);
 
 
 
 long  ledDelayRed, ledDelayBlue;
-#define CONNECT_TIMEOUT   30      // Seconds
-#define CONNECT_OK        0       // Status of successful connection to WiFi
-#define CONNECT_FAILED    (-99)   // Status of failed connection to WiFi
-
-// NTP Related Definitions
-#define NTP_PACKET_SIZE  48       // NTP time stamp is in the first 48 bytes of the message
 
 IPAddress     timeServerIP;       // time.nist.gov NTP server address
 const char*   ntpServerName = "nz.pool.ntp.org";
@@ -268,7 +271,7 @@ void setup() {
   Serial.println(F("LED CLOCK with modified TaskScheduler test #14 - Yield and internal StatusRequests"));
   Serial.println(F("=========================================================="));
   Serial.println();
-  tNtpUpdate.waitFor( tConnect.getInternalStatusRequest() );  // NTP Task will start only after connection is made
+  tntpUpdate.waitFor( tConnect.getInternalStatusRequest() );  // NTP Task will start only after connection is made
   sun.setPosition(LATITUDE, LONGITUDE, DST_OFFSET);
   startWebSocket();            // Start a WebSocket server
   startMDNS();                 // Start the mDNS responder
@@ -401,6 +404,7 @@ void connectCheck() {
    Initiate NTP update if connection was established
 */
 void ntpUpdateInit() {
+  Serial.println();
   Serial.print(millis());
   Serial.println(F(": ntpUpdateInit."));
 
@@ -424,7 +428,7 @@ void ntpUpdateInit() {
     Serial.println(F(": NTP server address lookup failed."));
     tLED.disable();
     udp.stop();
-    tNtpUpdate.disable();
+    tntpUpdate.disable();
     return;
   }
 
@@ -432,8 +436,8 @@ void ntpUpdateInit() {
   ledDelayBlue = TASK_SECOND / 8;
   tLED.enable();
 
-  tNtpUpdate.set( TASK_SECOND, CONNECT_TIMEOUT, &ntpCheck );
-  tNtpUpdate.enableDelayed();
+  // check NTP server response
+  tntpCheck.enableDelayed();
 }
 
 
@@ -482,7 +486,8 @@ void ntpCheck() {
   Serial.print(millis());
   Serial.println(F(": ntpCheck."));
 
-  if ( tNtpUpdate.getRunCounter() % 5 == 0) {
+//  if ( tntpUpdate.getRunCounter() % 5 == 0) {
+  if ( tntpCheck.getRunCounter() % 5 == 0) {
 
     Serial.print(millis());
     Serial.println(F(": Re-requesting NTP update..."));
@@ -497,27 +502,30 @@ void ntpCheck() {
   if ( doNtpUpdateCheck()) {
     Serial.print(millis());
     Serial.println(F(": NTP Update successful"));
-
+    Serial.printf("now %d\n", now());
     Serial.print(millis());
     Serial.print(F(": Unix time = "));
     Serial.println(epoch);
     setTime(epoch);
     adjustTime(hours_Offset_From_GMT * 3600);
     if (IsDst()) adjustTime(3600); // offset the system time by an hour for Daylight Savings
+    Serial.printf("now fixed %d\n", now());
     ClockInitialized = true;
-    ledDelayRed = TASK_SECOND / 3; //1
-    ledDelayBlue = 2 * TASK_SECOND; //2
+    //ledDelayRed = TASK_SECOND / 3; //1
+    //ledDelayBlue = 2 * TASK_SECOND; //2
     tLED.disable();
     tchangeClock.enable();
-    tNtpUpdate.disable();
+    tntpCheck.disable();
+    tntpUpdate.restartDelayed(NTP_CHECK_SEC * TASK_SECOND);
     udp.stop();
   }
   else {
-    if ( tNtpUpdate.isLastIteration() ) {
+    if ( tntpCheck.isLastIteration() ) {
       Serial.print(millis());
       Serial.println(F(": NTP Update failed"));
       ledDelayRed = TASK_SECOND / 2;
       ledDelayBlue = TASK_SECOND / 16;
+      tntpUpdate.restartDelayed(NTP_CHECK_SEC * TASK_SECOND);
       //tLED.disable();
       udp.stop();
     }
@@ -1231,9 +1239,6 @@ void changeClock() {
   else
     Serial.print('-');
   Draw_Clock(tnow, 4); // Draw the whole clock face with hours minutes and seconds
-  //TODO sync should be task every 3601 sec?
-  //ClockInitialized |= SetClockFromNTP(); // sync initially then every update_interval_secs seconds, updates system clock and adjust it for daylight savings
-
   //TODO could make daily task here
   // Check if new day and recalculate sunSet etc.
   if (tnow >= makeTime(calcTime))
