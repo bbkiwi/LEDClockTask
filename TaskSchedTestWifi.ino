@@ -486,7 +486,20 @@ void ntpCheck() {
   Serial.print(millis());
   Serial.println(F(": ntpCheck."));
 
-//  if ( tntpUpdate.getRunCounter() % 5 == 0) {
+  // The last iteration will only occur if fails to update
+  if ( tntpCheck.isLastIteration() ) {
+    Serial.print(millis());
+    Serial.println(F(": NTP Update failed"));
+    ledDelayRed = TASK_SECOND / 2;
+    ledDelayBlue = TASK_SECOND / 16;
+    //TODO could reschedual in shorter time than usual
+    tntpUpdate.restartDelayed(NTP_CHECK_SEC * TASK_SECOND);
+    //tLED.disable();
+    udp.stop();
+    return;
+  }
+
+  //  if ( tntpUpdate.getRunCounter() % 5 == 0) {
   if ( tntpCheck.getRunCounter() % 5 == 0) {
 
     Serial.print(millis());
@@ -518,17 +531,6 @@ void ntpCheck() {
     tntpCheck.disable();
     tntpUpdate.restartDelayed(NTP_CHECK_SEC * TASK_SECOND);
     udp.stop();
-  }
-  else {
-    if ( tntpCheck.isLastIteration() ) {
-      Serial.print(millis());
-      Serial.println(F(": NTP Update failed"));
-      ledDelayRed = TASK_SECOND / 2;
-      ledDelayBlue = TASK_SECOND / 16;
-      tntpUpdate.restartDelayed(NTP_CHECK_SEC * TASK_SECOND);
-      //tLED.disable();
-      udp.stop();
-    }
   }
 }
 
